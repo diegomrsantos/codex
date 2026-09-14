@@ -33,6 +33,9 @@ const OPENAI_MODEL_HEADER: &str = "openai-model";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
+#[cfg(test)]
+mod terminal_failure_tests;
+
 pub fn spawn_response_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
@@ -664,6 +667,7 @@ async fn process_sse_with_treatment(
             return;
         }
 
+        let is_failed = event.kind() == "response.failed";
         match process_responses_event(event) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
@@ -676,6 +680,11 @@ async fn process_sse_with_treatment(
             }
             Ok(None) => {}
             Err(error) => {
+                // A failed response is terminal even if the peer keeps the body open.
+                if is_failed {
+                    let _ = tx_event.send(Err(error.into_api_error())).await;
+                    return;
+                }
                 response_error = Some(error.into_api_error());
             }
         };
