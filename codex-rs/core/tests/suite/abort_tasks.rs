@@ -2,6 +2,7 @@ use assert_matches::assert_matches;
 use codex_core::StartThreadOptions;
 use codex_core::SuspendTurnOutcome;
 use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
 use codex_history::RolloutItem;
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,6 +203,128 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
         unreachable!("wait_for_event returned unexpected event");
     };
     assert_eq!(completed.turn_id, turn_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_persists_accepted_steers_before_task_cleanup() {
+    const FIRST_STEER: &str = "accepted steer one";
+    const SECOND_STEER: &str = "accepted steer two";
+
+    let server = start_mock_server().await;
+    mount_response_once(
+        &server,
+        sse_response(sse(vec![
+            ev_response_created("blocked-response"),
+            ev_completed("blocked-response"),
+        ]))
+        .set_delay(Duration::from_secs(60)),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_auto_env(&server)
+        .await
+        .expect("start test thread");
+    let codex = Arc::clone(&test.codex);
+
+    let TurnInputSubmission::Started { turn_id } = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "initial prompt".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("start initial turn")
+    else {
+        panic!("initial input should start a turn");
+    };
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnStarted(_))).await;
+
+    for text in [FIRST_STEER, SECOND_STEER] {
+        assert_eq!(
+            codex
+                .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: text.into(),
+                    text_elements: Vec::new(),
+                }]))
+                .await
+                .expect("accept steer"),
+            TurnInputSubmission::Steered {
+                turn_id: turn_id.clone(),
+            }
+        );
+    }
+
+    codex.submit(Op::Interrupt).await.expect("interrupt turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
+
+    let rollout = tokio::fs::read_to_string(codex.rollout_path().expect("rollout path"))
+        .await
+        .expect("read durable rollout");
+    let first_position = rollout.find(FIRST_STEER).expect("first steer in rollout");
+    let second_position = rollout.find(SECOND_STEER).expect("second steer in rollout");
+    assert!(
+        first_position < second_position,
+        "accepted steers should retain their order"
+    );
+    codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown test thread");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_persists_accepted_steer_before_task_cleanup() {
+    const STEERED_TEXT: &str = "accepted steer survives shutdown";
+
+    let server = start_mock_server().await;
+    mount_response_once(
+        &server,
+        sse_response(sse(vec![
+            ev_response_created("blocked-response"),
+            ev_completed("blocked-response"),
+        ]))
+        .set_delay(Duration::from_secs(60)),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_auto_env(&server)
+        .await
+        .expect("start test thread");
+    let codex = Arc::clone(&test.codex);
+
+    let TurnInputSubmission::Started { turn_id } = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "initial prompt".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("start initial turn")
+    else {
+        panic!("initial input should start a turn");
+    };
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnStarted(_))).await;
+
+    assert_eq!(
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: STEERED_TEXT.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .expect("accept steer"),
+        TurnInputSubmission::Steered { turn_id }
+    );
+
+    let rollout_path = codex.rollout_path().expect("rollout path");
+    codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown test thread");
+    let rollout = tokio::fs::read_to_string(rollout_path)
+        .await
+        .expect("read durable rollout");
+    assert!(rollout.contains(STEERED_TEXT));
 }
 
 /// After an interrupt we expect the next request to the model to include both
