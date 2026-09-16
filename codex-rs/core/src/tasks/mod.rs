@@ -940,6 +940,21 @@ impl Session {
             }
         }
 
+        // Steering is acknowledged before its input reaches history. Preserve accepted input
+        // before the abort path clears the turn state or emits the terminal event.
+        let pending_input = self
+            .input_queue
+            .take_pending_input_for_turn_state(turn_state)
+            .await;
+        run_hooks_and_record_inputs(
+            self,
+            &task.turn_context,
+            &task.turn_context.capture_current_model_info(),
+            &pending_input,
+            PersistContext::Standard,
+        )
+        .await;
+
         if reason == TurnAbortReason::Interrupted {
             run_turn_interrupt_hooks(self, &task.turn_context, turn_state).await;
         }
